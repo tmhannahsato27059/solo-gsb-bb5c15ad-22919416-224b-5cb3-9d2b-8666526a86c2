@@ -1,6 +1,6 @@
 # 直流配电树压降校核 API
 
-基于 FastAPI 的直流配电树校核服务：输入以 `source` 为根的配电树（电源电压、线段电阻与额定电流、各节点恒定负载、最低允许电压），自叶向根累计每段承载的全部下游电流，再自根向叶计算压降与节点电压，返回各段电流、各节点电压以及超额定电流 / 欠压位置；并可评估指定节点可追加的最大恒定负载电流（`/capacity`）。
+基于 FastAPI 的直流配电树校核服务：输入以 `source` 为根的配电树（电源电压、线段电阻与额定电流、各节点恒定负载、最低允许电压），自叶向根累计每段承载的全部下游电流，再自根向叶计算压降与节点电压，返回各段电流、各节点电压以及超额定电流 / 欠压位置；并可评估指定节点可追加的最大恒定负载电流（`/capacity`），或根据若干线段的实测电流定位唯一未登记正恒定负载的候选节点（`/unregistered-load`）。
 
 ## 快速启动（单条命令）
 
@@ -23,6 +23,7 @@ docker compose up --build
 - 健康检查：`GET http://localhost:8000/health`
 - 校核接口：`POST http://localhost:8000/evaluate`
 - 增容评估接口：`POST http://localhost:8000/capacity`
+- 未登记负载定位接口：`POST http://localhost:8000/unregistered-load`
 
 ## 请求格式
 
@@ -148,6 +149,70 @@ curl -X POST http://localhost:8000/capacity \
 - `max_additional_current`：目标节点可追加的最大恒定负载电流 (A)，向下截断至 6 位小数。
 - `limiting_factors`：达到上限的限制因素；`type=segment` 表示线段额定电流限制，`type=node` 表示节点欠压限制，`id` 为线段 id 或节点名称。多个因素同时触限时全部列出。
 
+## 未登记负载定位：POST /unregistered-load
+
+`POST /unregistered-load`，Content-Type: `application/json`。请求沿用 `/evaluate` 的全部参数（`min_voltage` 参与校验但不影响定位），并额外附加若干线段的实测电流：
+
+| 字段 | 类型 | 约束 | 说明 |
+| --- | --- | --- | --- |
+| `measurements` | array | 可空 | 线段实测电流列表，测点可不覆盖全树 |
+| `measurements[].segment_id` | string | 必填，唯一且存在于树中 | 被测线段标识（重复或不存在返回 `400 invalid_input`） |
+| `measurements[].current` | number | ≥ 0 且为有限数 | 实测电流 (A)（负数或 NaN/Infinity 返回 `422`） |
+
+判定规则（假定恰有一个非 `source` 节点存在未登记的正恒定负载）：
+
+- 对每个测点计算 **差值 = 实测电流 − 未舍入基线线段电流**；|差值| ≤ 1e-6 A 视为无差异；
+- 出现负差（差值 < -1e-6 A，实测低于基线）→ `inconsistent`；
+- 显著正差（差值 > 1e-6 A）须在 1e-6 A 内相互一致，否则 → `inconsistent`；
+- 无显著正差 → `undetermined`（未登记负载为零、过小或位于未测支路，无法确定）；
+- 差值可确定时，未登记负载电流取显著正差的均值（按六位小数返回），并筛选候选节点：显著正差测点须位于候选节点的祖先路径上、零差测点须不在其祖先路径上；未测支路允许多解（返回多个候选节点），无相容节点 → `inconsistent`。
+
+### 请求示例
+
+```bash
+curl -X POST http://localhost:8000/unregistered-load \
+  -H "Content-Type: application/json" \
+  -d '{
+    "source_voltage": 48.0,
+    "min_voltage": 40.0,
+    "segments": [
+      {"id": "s1", "parent": "source", "child": "a", "resistance": 0.1,  "rated_current": 20.0},
+      {"id": "s2", "parent": "a",      "child": "b", "resistance": 0.2,  "rated_current": 10.0},
+      {"id": "s3", "parent": "a",      "child": "c", "resistance": 0.05, "rated_current": 15.0}
+    ],
+    "loads": [
+      {"node": "a", "current": 2.0},
+      {"node": "b", "current": 5.0},
+      {"node": "c", "current": 8.0}
+    ],
+    "measurements": [
+      {"segment_id": "s1", "current": 18.0},
+      {"segment_id": "s3", "current": 8.0}
+    ]
+  }'
+```
+
+### 响应示例（200，located）
+
+```json
+{
+  "status": "located",
+  "load_current": 3.0,
+  "candidate_nodes": ["a", "b"],
+  "measurements": [
+    {"segment_id": "s1", "baseline_current": 15.0, "measured_current": 18.0, "difference": 3.0},
+    {"segment_id": "s3", "baseline_current": 8.0, "measured_current": 8.0, "difference": 0.0}
+  ],
+  "reasons": []
+}
+```
+
+- `status`：`located`（已定位，返回候选节点与负载电流）、`undetermined`（无显著正差，无法确定）、`inconsistent`（实测与基线矛盾）。
+- `load_current`：未登记负载电流估计值 (A)，六位小数；仅 `located` 时给出，其余为 `null`。
+- `candidate_nodes`：与全部测点相容的节点（BFS 顺序）；仅 `located` 时非空。上例中 s1 正差 +3A 而 s3 无差异，负载在 s1 下游但不在 c 支路，故候选为 `a`、`b`。
+- `measurements`：各测点与未舍入基线的对比（展示值按 6 位小数舍入，判定使用未舍入值）。
+- `reasons`：判定为 `inconsistent` 的原因列表，其余情况为空。
+
 ## 错误说明
 
 所有错误均返回统一结构：
@@ -164,9 +229,11 @@ curl -X POST http://localhost:8000/capacity \
 
 | 状态码 | code | 触发场景 |
 | --- | --- | --- |
-| `422` | `validation_error` | 非正电源电压、负电阻、负负载电流、非正额定电流、字段缺失或类型错误等 |
-| `400` | `invalid_input` | 无效树（不连通、存在环路、节点多父节点、`source` 作为子节点、线段 id 重复）、负载引用不存在的节点，或 `target_node` 为 `source` / 不存在于树中 |
+| `422` | `validation_error` | 非正电源电压、负电阻、负负载电流、非正额定电流、实测电流为负或不是有限数（NaN/Infinity）、字段缺失或类型错误等 |
+| `400` | `invalid_input` | 无效树（不连通、存在环路、节点多父节点、`source` 作为子节点、线段 id 重复）、负载引用不存在的节点、`target_node` 为 `source` / 不存在于树中，或测量线段 id 重复 / 不存在于树中 |
 | `400` | `baseline_violation` | `/capacity` 基线校核已存在超额定电流或欠压，`details` 列出越限线段与节点 |
+
+注意：`/unregistered-load` 的 `inconsistent` / `undetermined` 是正常分析结论，以 `200` 返回并体现在响应体的 `status` 字段中，不属于上表错误。
 
 ## 本地开发与测试
 
@@ -181,11 +248,12 @@ uvicorn app.main:app --reload --port 8000
 ```
 app/
   main.py    # FastAPI 应用与错误处理
-  core.py    # 树校验 + 电流累计 + 压降计算 + 增容评估
+  core.py    # 树校验 + 电流累计 + 压降计算 + 增容评估 + 未登记负载定位
   models.py  # 请求 / 响应模型
 tests/
   test_evaluate.py
   test_capacity.py
+  test_unregistered_load.py
 Dockerfile
 docker-compose.yml
 requirements.txt

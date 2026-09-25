@@ -9,6 +9,10 @@
 ``capacity`` 在基线校核通过的前提下，评估目标节点可追加的最大恒定负载电流：
 目标到 source 路径上的线段电流同步增加，任一节点的新增压降等于它与目标节点
 两条根路径的公共线段电阻之和乘新增电流（兄弟支路经公共上游线段同样受影响）。
+
+``unregistered_load`` 假定恰有一个非 source 节点存在未登记的正恒定负载，
+将各测点实测电流与未舍入基线线段电流比较：显著正差（> 1e-6 A）须在 1e-6 A
+内相互一致，据此估计负载电流，并按测点是否位于候选节点的祖先路径筛选相容节点。
 """
 
 from __future__ import annotations
@@ -21,6 +25,7 @@ from typing import Optional, Sequence
 ROOT_NODE = "source"
 EPS = 1e-9
 ROUND_DIGITS = 6
+MEASURE_TOL = 1e-6  # 实测差值容差 (A)：|实测 - 基线| ≤ 1e-6 视为无差异
 
 
 class InputValidationError(ValueError):
@@ -379,3 +384,111 @@ def capacity(
         "max_additional_current": _truncate(max(0.0, raw_max)),
         "limiting_factors": limiting_factors,
     }
+
+
+def unregistered_load(
+    source_voltage: float,
+    segments_in: Sequence,
+    loads_in: Sequence,
+    measurements_in: Sequence,
+) -> dict:
+    """定位唯一未登记正恒定负载，返回可 JSON 序列化的结果字典。
+
+    假定恰有一个非 source 节点存在未登记的正恒定负载（测点可不覆盖全树）。
+    对每个测点计算 差值 = 实测电流 - 未舍入基线线段电流：
+
+    - 差值 < -1e-6 A（实测低于基线），或显著正差（> 1e-6 A）相互差异超过
+      1e-6 A → ``inconsistent``；
+    - 无显著正差 → ``undetermined``；
+    - 否则负载电流取显著正差的均值（按 6 位小数返回），并筛选候选节点：
+      显著正差测点须位于候选节点的祖先路径上，零差测点须不在其祖先路径上；
+      未测支路允许多解，无相容节点 → ``inconsistent``。
+    """
+    tree = _prepare_tree(source_voltage, segments_in, loads_in)
+
+    # 测点校验：线段 id 唯一且存在于树中
+    known_seg_ids = {seg.id for seg in tree.segments}
+    errors: list[str] = []
+    seen_ids: set[str] = set()
+    for m in measurements_in:
+        if m.segment_id in seen_ids:
+            errors.append(f"测量线段 id 重复: '{m.segment_id}'")
+        seen_ids.add(m.segment_id)
+        if m.segment_id not in known_seg_ids:
+            errors.append(f"测量线段 '{m.segment_id}' 不存在于树中")
+    if errors:
+        raise InputValidationError("实测电流定义无效", errors)
+
+    # 与未舍入基线比较（差值 = 实测 - 基线）
+    diffs: list[tuple[str, float]] = []
+    measurement_results = []
+    for m in measurements_in:
+        baseline = tree.seg_current[m.segment_id]
+        diff = m.current - baseline
+        diffs.append((m.segment_id, diff))
+        measurement_results.append(
+            {
+                "segment_id": m.segment_id,
+                "baseline_current": _round(baseline),
+                "measured_current": m.current,
+                "difference": _round(diff),
+            }
+        )
+
+    def _result(status: str, load_current: Optional[float], candidates: list[str], reasons: list[str]) -> dict:
+        return {
+            "status": status,
+            "load_current": load_current,
+            "candidate_nodes": candidates,
+            "measurements": measurement_results,
+            "reasons": reasons,
+        }
+
+    # 负差：实测低于基线，与“仅新增正负载”的前提矛盾
+    negative = [(seg_id, diff) for seg_id, diff in diffs if diff < -MEASURE_TOL]
+    if negative:
+        reasons = [
+            f"线段 '{seg_id}' 实测电流低于基线电流（差值 {_round(diff)} A）"
+            for seg_id, diff in negative
+        ]
+        return _result("inconsistent", None, [], reasons)
+
+    positives = [(seg_id, diff) for seg_id, diff in diffs if diff > MEASURE_TOL]
+    if not positives:
+        return _result("undetermined", None, [], [])
+
+    # 显著正差须在 1e-6 A 内相互一致
+    spread = max(diff for _, diff in positives) - min(diff for _, diff in positives)
+    if spread > MEASURE_TOL:
+        detail = "、".join(f"线段 '{seg_id}' 为 {_round(diff)} A" for seg_id, diff in positives)
+        return _result("inconsistent", None, [], [f"显著正差相互矛盾（{detail}），差异超过 1e-6 A"])
+
+    load_current = sum(diff for _, diff in positives) / len(positives)
+
+    # 候选筛选：显著正差测点须在候选节点祖先路径上，零差测点须不在
+    seg_by_child = {seg.child: seg for seg in tree.segments}
+    positive_ids = {seg_id for seg_id, _ in positives}
+    zero_ids = {seg_id for seg_id, diff in diffs if abs(diff) <= MEASURE_TOL}
+
+    candidates: list[str] = []
+    for node in tree.order:  # BFS 顺序，根在前
+        if node == ROOT_NODE:
+            continue
+        path_ids: set[str] = set()
+        current = node
+        while current != ROOT_NODE:
+            seg = seg_by_child[current]
+            path_ids.add(seg.id)
+            current = seg.parent
+        if positive_ids <= path_ids and zero_ids.isdisjoint(path_ids):
+            candidates.append(node)
+
+    if not candidates:
+        return _result(
+            "inconsistent",
+            None,
+            [],
+            ["测点位置相互矛盾：不存在使显著正差测点位于祖先路径且零差测点不在祖先路径的节点"],
+        )
+
+    return _result("located", _round(load_current), candidates, [])
