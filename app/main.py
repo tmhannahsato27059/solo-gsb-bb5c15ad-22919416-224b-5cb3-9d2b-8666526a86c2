@@ -6,17 +6,25 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from .core import BaselineViolationError, InputValidationError, capacity, evaluate
-from .models import CapacityRequest, CapacityResponse, EvaluateRequest, EvaluateResponse
+from .core import BaselineViolationError, InputValidationError, capacity, evaluate, unregistered_load
+from .models import (
+    CapacityRequest,
+    CapacityResponse,
+    EvaluateRequest,
+    EvaluateResponse,
+    UnregisteredLoadRequest,
+    UnregisteredLoadResponse,
+)
 
 app = FastAPI(
     title="直流配电树压降校核 API",
     description=(
         "接收以 source 为根的配电树（线段电阻 / 额定电流、节点恒定负载），"
         "自叶向根累计各段电流，自根向叶计算压降与节点电压，"
-        "返回超额定电流与欠压位置；并可评估指定节点可追加的最大恒定负载电流。"
+        "返回超额定电流与欠压位置；可评估指定节点可追加的最大恒定负载电流；"
+        "并可依据线段实测电流定位唯一未登记的正恒定负载。"
     ),
-    version="1.1.0",
+    version="1.2.0",
 )
 
 
@@ -38,6 +46,8 @@ _FIELD_LABELS = {
     "node": "节点",
     "current": "负载电流",
     "target_node": "目标节点",
+    "measurements": "实测电流列表",
+    "segment_id": "线段标识",
 }
 
 _CUSTOM_MESSAGES = {
@@ -52,11 +62,16 @@ _CUSTOM_MESSAGES = {
 def _translate_error(err: dict) -> dict:
     loc = [str(x) for x in err.get("loc", []) if x != "body"]
     field = loc[-1] if loc else ""
+    in_measurements = "measurements" in loc
     label = _FIELD_LABELS.get(field, field or "请求体")
+    if in_measurements and field == "current":
+        label = "实测电流"
     err_type = err.get("type", "")
     ctx = err.get("ctx", {})
 
     custom = _CUSTOM_MESSAGES.get((field, err_type))
+    if custom and in_measurements and field == "current":
+        custom = custom.replace("负载电流", "实测电流")
     if custom:
         message = custom
     elif err_type == "missing":
@@ -65,6 +80,8 @@ def _translate_error(err: dict) -> dict:
         message = f"{label}必须大于 {ctx.get('gt')}"
     elif err_type == "greater_than_equal":
         message = f"{label}不能小于 {ctx.get('ge')}"
+    elif err_type == "finite_number":
+        message = f"{label}必须为有限数"
     elif err_type == "string_too_short":
         message = f"{label}不能为空字符串"
     elif err_type in ("too_short", "list_too_short"):
@@ -132,6 +149,21 @@ def capacity_endpoint(payload: CapacityRequest) -> dict:
     )
 
 
+@app.post(
+    "/unregistered-load",
+    response_model=UnregisteredLoadResponse,
+    summary="依据线段实测电流定位唯一未登记的正恒定负载",
+)
+def unregistered_load_endpoint(payload: UnregisteredLoadRequest) -> dict:
+    return unregistered_load(
+        source_voltage=payload.source_voltage,
+        min_voltage=payload.min_voltage,
+        segments_in=payload.segments,
+        loads_in=payload.loads,
+        measurements_in=payload.measurements,
+    )
+
+
 @app.get("/health", summary="健康检查")
 def health() -> dict:
     return {"status": "ok"}
@@ -143,6 +175,7 @@ def index() -> dict:
         "service": "dc-tree-voltage-drop-api",
         "evaluate": "POST /evaluate",
         "capacity": "POST /capacity",
+        "unregistered_load": "POST /unregistered-load",
         "docs": "/docs",
         "health": "/health",
     }

@@ -88,6 +88,21 @@ class CapacityRequest(EvaluateRequest):
     target_node: str = Field(min_length=1, description="目标节点名称（须为已有的非 source 节点）")
 
 
+class MeasurementInput(BaseModel):
+    """一条线段的实测电流。"""
+
+    segment_id: str = Field(min_length=1, description="线段标识，须存在于树中且在所有测点中唯一")
+    current: float = Field(ge=0, allow_inf_nan=False, description="实测电流 (A)，须为非负有限数")
+
+
+class UnregisteredLoadRequest(EvaluateRequest):
+    """未登记负载定位请求：在 /evaluate 参数基础上附加若干线段实测电流。"""
+
+    measurements: list[MeasurementInput] = Field(
+        description="线段实测电流列表，测点可不覆盖全树（可为空）"
+    )
+
+
 class LimitingFactor(BaseModel):
     type: str = Field(description="限制类型：segment=线段额定电流，node=节点最低允许电压")
     id: str = Field(description="达到上限的线段 id 或节点名称")
@@ -99,3 +114,23 @@ class CapacityResponse(BaseModel):
         description="目标节点可增加的最大恒定负载电流 (A)，向下截断至 6 位小数"
     )
     limiting_factors: list[LimitingFactor] = Field(description="达到上限的线段 / 节点")
+
+
+class MeasurementComparison(BaseModel):
+    segment_id: str
+    measured: float = Field(description="实测电流 (A)")
+    baseline: float = Field(description="基线线段电流 (A)，六位小数展示值（判定使用未舍入值）")
+    difference: float = Field(description="实测与基线电流之差 (A)，六位小数展示值")
+
+
+class UnregisteredLoadResponse(BaseModel):
+    status: str = Field(
+        description="判定结果：located=已定位，undetermined=无正差无法确定，inconsistent=数据矛盾"
+    )
+    load_current: Optional[float] = Field(
+        description="未登记负载电流 (A)，六位小数；仅 status=located 时有值"
+    )
+    candidate_nodes: list[str] = Field(
+        description="与实测相容的候选节点（BFS 顺序）；仅 status=located 时非空"
+    )
+    measurements: list[MeasurementComparison] = Field(description="各测点与基线电流的比较")

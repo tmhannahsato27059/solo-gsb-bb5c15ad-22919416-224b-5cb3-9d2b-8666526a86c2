@@ -9,6 +9,11 @@
 ``capacity`` 在基线校核通过的前提下，评估目标节点可追加的最大恒定负载电流：
 目标到 source 路径上的线段电流同步增加，任一节点的新增压降等于它与目标节点
 两条根路径的公共线段电阻之和乘新增电流（兄弟支路经公共上游线段同样受影响）。
+
+``unregistered_load`` 假定恰有一个非 source 节点挂接未登记的正恒定负载，将各测点
+实测电流与未舍入基线线段电流比较：正差（> 1e-6 A）须彼此一致（极差 ≤ 1e-6 A），
+其均值即未登记负载电流；实测线段集合恰为候选节点根路径上测点集合的节点全部相容，
+未测支路因此允许多解。
 """
 
 from __future__ import annotations
@@ -21,6 +26,7 @@ from typing import Optional, Sequence
 ROOT_NODE = "source"
 EPS = 1e-9
 ROUND_DIGITS = 6
+MEASURE_TOL = 1e-6  # 实测电流比较容差 (A)
 
 
 class InputValidationError(ValueError):
@@ -379,3 +385,95 @@ def capacity(
         "max_additional_current": _truncate(max(0.0, raw_max)),
         "limiting_factors": limiting_factors,
     }
+
+
+def unregistered_load(
+    source_voltage: float,
+    min_voltage: float,
+    segments_in: Sequence,
+    loads_in: Sequence,
+    measurements_in: Sequence,
+) -> dict:
+    """定位唯一未登记的正恒定负载。
+
+    假定恰有一个非 source 节点挂接未登记的正恒定负载 I_u，则任一实测线段的
+    读数 = 未舍入基线电流 + I_u（负载位于该段下游）或 = 基线电流（否则）。
+    判定流程（容差 MEASURE_TOL = 1e-6 A）：
+
+    1. 任一测点差值 < -容差：正负载不可能使实测低于基线 → inconsistent；
+    2. 无正差（所有差值 ≤ 容差）：负载电流无法确定 → undetermined；
+    3. 正差彼此极差 > 容差：互相矛盾 → inconsistent；
+    4. 否则 I_u 取各正差的均值，候选节点须满足：其根路径上的实测线段集合
+       恰好等于正差线段集合（路径上的测点必须观测到增量，路径外的测点不得
+       观测到增量）；未测支路不施加约束，因此允许多解；
+    5. 无相容节点 → inconsistent，否则 located 并返回六位小数负载电流。
+    """
+    tree = _prepare_tree(source_voltage, segments_in, loads_in)
+
+    # 实测校验：线段 id 唯一且存在于树中
+    known_ids = {seg.id for seg in tree.segments}
+    errors: list[str] = []
+    seen_ids: set[str] = set()
+    for m in measurements_in:
+        if m.segment_id in seen_ids:
+            errors.append(f"实测线段 id 重复: '{m.segment_id}'")
+        seen_ids.add(m.segment_id)
+        if m.segment_id not in known_ids:
+            errors.append(f"实测线段 '{m.segment_id}' 不存在于树中")
+    if errors:
+        raise InputValidationError("实测电流定义无效", errors)
+
+    # 与未舍入基线线段电流比较（保持输入顺序）
+    comparisons = []
+    diffs: dict[str, float] = {}
+    for m in measurements_in:
+        baseline = tree.seg_current[m.segment_id]
+        diff = m.current - baseline
+        diffs[m.segment_id] = diff
+        comparisons.append(
+            {
+                "segment_id": m.segment_id,
+                "measured": m.current,
+                "baseline": _round(baseline),
+                "difference": _round(diff),
+            }
+        )
+
+    def _result(status: str, load_current: Optional[float] = None, candidates: Optional[list[str]] = None) -> dict:
+        return {
+            "status": status,
+            "load_current": load_current,
+            "candidate_nodes": candidates or [],
+            "measurements": comparisons,
+        }
+
+    # 负差（超出容差）：正负载不可能使实测低于基线
+    if any(diff < -MEASURE_TOL for diff in diffs.values()):
+        return _result("inconsistent")
+
+    positive_ids = {sid for sid, diff in diffs.items() if diff > MEASURE_TOL}
+    if not positive_ids:
+        return _result("undetermined")
+
+    # 所有正差须在容差内一致（极差 ≤ 容差）
+    positive_values = [diffs[sid] for sid in positive_ids]
+    if max(positive_values) - min(positive_values) > MEASURE_TOL:
+        return _result("inconsistent")
+
+    load_current = sum(positive_values) / len(positive_values)
+
+    # 自根向叶累计各节点根路径上的实测线段集合，筛选与正差集合一致的节点
+    candidates: list[str] = []
+    path_measured: dict[str, frozenset[str]] = {ROOT_NODE: frozenset()}
+    for node in tree.order:  # BFS 顺序，父节点先于子节点
+        inherited = path_measured[node]
+        for seg in tree.children_map.get(node, []):
+            child_set = inherited | ({seg.id} if seg.id in diffs else frozenset())
+            path_measured[seg.child] = frozenset(child_set)
+            if child_set == positive_ids:
+                candidates.append(seg.child)
+
+    if not candidates:
+        return _result("inconsistent")
+
+    return _result("located", load_current=_round(load_current), candidates=candidates)
